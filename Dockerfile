@@ -1,4 +1,5 @@
 FROM golang:1.23-alpine AS builder
+ENV GOTOOLCHAIN=auto
 RUN apk --no-cache add git ca-certificates tzdata
 WORKDIR /src
 COPY go.mod go.sum ./
