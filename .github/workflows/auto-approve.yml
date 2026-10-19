@@ -1,0 +1,15 @@
+name: Auto-Approve Dependabot
+on: pull_request_target
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  auto-approve:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - uses: peter-evans/auto-approve@v4
+        with:
+          pull-request-number: ${{ github.event.pull_request.number }}
