@@ -17,7 +17,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
@@ -45,11 +47,11 @@ func (tb *tokenBucket) allow() bool {
 	if tb.tokens > tb.max {
 		tb.tokens = tb.max
 	}
-	tb.lastRefill = now
 	if tb.tokens < 1 {
 		return false
 	}
 	tb.tokens--
+	tb.lastRefill = now
 	return true
 }
 
@@ -63,7 +65,7 @@ type rateLimiter struct {
 func newRateLimiter(limit float64) *rateLimiter {
 	return &rateLimiter{
 		limit:    limit,
-		bucket:   &tokenBucket{max: limit, refillRate: limit, lastRefill: time.Now()},
+		bucket:   &tokenBucket{tokens: limit, max: limit, refillRate: limit, lastRefill: time.Now()},
 		clientDB: make(map[string]*tokenBucket),
 	}
 }
@@ -75,7 +77,7 @@ func (rl *rateLimiter) allow(clientAddr string) bool {
 	rl.mu.Lock()
 	tb, exists := rl.clientDB[clientAddr]
 	if !exists || time.Since(tb.lastRefill) > 60*time.Second {
-		tb = &tokenBucket{max: rl.limit, refillRate: rl.limit, lastRefill: time.Now()}
+		tb = &tokenBucket{tokens: rl.limit, max: rl.limit, refillRate: rl.limit, lastRefill: time.Now()}
 		rl.clientDB[clientAddr] = tb
 	}
 	rl.mu.Unlock()
@@ -122,18 +124,29 @@ func main() {
 		log.Fatal("DYNAMODB_TABLE and AWS_REGION required")
 	}
 
-	cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion(region))
+	endpointURL := os.Getenv("DYNAMODB_ENDPOINT")
+	configOpts := []func(*config.LoadOptions) error{config.WithRegion(region)}
+	if endpointURL != "" {
+		configOpts = append(configOpts, config.WithCredentialsProvider(aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider("test", "test", ""))))
+	}
+	cfg, err := config.LoadDefaultConfig(context.Background(), configOpts...)
 	if err != nil {
 		log.Fatalf("failed to load aws config: %v", err)
 	}
-	db := dynamodb.NewFromConfig(cfg)
+	dbOpts := []func(*dynamodb.Options){}
+	if endpointURL != "" {
+		dbOpts = append(dbOpts, dynamodb.WithEndpointResolver(dynamodb.EndpointResolverFromURL(endpointURL)))
+	}
+	db := dynamodb.NewFromConfig(cfg, dbOpts...)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", homeHandler)
 	mux.HandleFunc("/health", healthHandler)
-	mux.HandleFunc("/api/items", func(w http.ResponseWriter, r *http.Request) {
+	listItemsHandler := func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/api/items")
-		path = strings.TrimSuffix(path, "/")
+		if path == "/" || path == "" {
+			path = ""
+		}
 
 		switch {
 		case path == "" && r.Method == http.MethodGet:
@@ -141,13 +154,15 @@ func main() {
 		case path == "" && r.Method == http.MethodPost:
 			createItem(w, r, db, table)
 		case path != "" && r.Method == http.MethodGet:
-			getItem(w, r, path, db, table)
+			getItem(w, r, strings.TrimPrefix(path, "/"), db, table)
 		case path != "" && r.Method == http.MethodDelete:
-			deleteItem(w, r, path, db, table)
+			deleteItem(w, r, strings.TrimPrefix(path, "/"), db, table)
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
-	})
+	}
+	mux.HandleFunc("/api/items", listItemsHandler)
+	mux.HandleFunc("/api/items/", listItemsHandler)
 
 	srv := &http.Server{Addr: ":" + port, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		clientAddr := r.RemoteAddr
@@ -222,13 +237,9 @@ func listItems(w http.ResponseWriter, r *http.Request, db *dynamodb.Client, tabl
 		}
 	}
 
-	input := &dynamodb.QueryInput{
-		TableName:              &table,
-		Limit:                  awsInt32(int32(limit)),
-		KeyConditionExpression: awsStr("begins_with(id, :id)"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":id": &types.AttributeValueMemberS{Value: ""},
-		},
+	input := &dynamodb.ScanInput{
+		TableName: &table,
+		Limit:     awsInt32(int32(limit)),
 	}
 	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
 		var keys map[string]types.AttributeValue
@@ -237,7 +248,7 @@ func listItems(w http.ResponseWriter, r *http.Request, db *dynamodb.Client, tabl
 		}
 	}
 
-	result, err := db.Query(r.Context(), input)
+	result, err := db.Scan(r.Context(), input)
 	if err != nil {
 		http.Error(w, "query failed", http.StatusInternalServerError)
 		return
